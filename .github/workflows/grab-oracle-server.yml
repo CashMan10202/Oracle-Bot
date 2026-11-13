@@ -1,0 +1,83 @@
+name: Grab Oracle server
+# Manual runs started with timing values show them in the run title (for the timing test).
+run-name: ${{ inputs.pause && format('Timing test p{0} b{1} g{2}{3}', inputs.pause, inputs.backoff, inputs.gap, inputs.label != '' && format(' {0}', inputs.label) || '') || 'Grab Oracle server' }}
+
+on:
+  schedule:
+    # Every 15 min, offset off the :00/:15/:30/:45 marks. GitHub drops or delays
+    # scheduled runs at those busy times, so odd minutes fire more reliably.
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:          # "Run workflow" button for a manual check
+    inputs:                   # optional timing overrides; leave blank for normal timing
+      pause:
+        description: "Seconds between rounds (blank = 60)"
+        required: false
+        default: ""
+      backoff:
+        description: "Seconds to wait after a 429 (blank = 180)"
+        required: false
+        default: ""
+      gap:
+        description: "Seconds between zones (blank = 0)"
+        required: false
+        default: ""
+      label:
+        description: "Extra tag for the run title, e.g. i20 (timing test only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: grab-oracle-server
+  cancel-in-progress: false
+
+jobs:
+  try:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Oracle CLI
+        run: pip install --quiet oci-cli
+
+      - name: Write Oracle config
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<CFG
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/key.pem
+          CFG
+          chmod 600 ~/.oci/config
+          oci setup repair-file-permissions --file ~/.oci/config || true
+
+      - name: Try to create the server
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PAUSE: ${{ inputs.pause }}
+          BACKOFF: ${{ inputs.backoff }}
+          ZONE_GAP: ${{ inputs.gap }}
+        run: ./scripts/grab-oracle-server.sh
+
+      - name: Open an issue if the run broke before trying
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --author app/github-actions --search 'in:title "Oracle bot error"' --json number -q '.[].number')" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --assignee "$GITHUB_REPOSITORY_OWNER" --title "⚠️ Oracle bot error: run failed" \
+              --body "Check the log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
